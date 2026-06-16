@@ -85,6 +85,7 @@ export class GameEngine {
   private comboMult = 1; // battery-fuelled score multiplier (1..MULT_MAX)
   private multTimer = 0; // seconds left before the multiplier decays to 1
   private maxMult = 1; // highest multiplier reached this run
+  private corridorY = H / 2; // meandering centre of the safe passage
   private level: LevelTheme = LEVELS[0];
   private statsAccum = 0;
   private grace = 0; // seconds the sun hovers before gravity kicks in
@@ -162,72 +163,92 @@ export class GameEngine {
     this.comboMult = 1;
     this.multTimer = 0;
     this.maxMult = 1;
+    this.corridorY = H / 2;
     this.thrusting = false;
     this.level = LEVELS[0];
     let x = W + 80;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       this.spawnObstacle(x);
-      x += this.level.spacing;
+      x += this.nextAdvance();
     }
   }
 
-  /** Number of cloud bands a column should hold, ramping with difficulty. */
-  private cloudCountFor(): number {
-    const last = LEVELS[LEVELS.length - 1];
-    let n = this.level.clouds;
-    // Keep ramping past the final authored level: one more band every ~700m.
-    if (this.level.index === last.index) {
-      n += Math.floor(Math.max(0, this.distance - last.startsAt) / 700);
-    }
-    n = Math.min(4, n);
-    // Per-column variety: occasionally ease off by one for breathing room.
-    if (n > 1 && Math.random() < 0.35) n -= 1;
-    return n;
+  /** Randomised horizontal distance to the next cloud group (unpredictable
+   *  rhythm; the occasional tight cluster fuses into a thicker wall). */
+  private nextAdvance(): number {
+    const base = this.level.spacing;
+    if (Math.random() < 0.15) return base * (0.45 + Math.random() * 0.2);
+    return base * (0.7 + Math.random() * 0.75);
   }
 
-  /** Build a column of free-floating clouds that always leaves passable gaps. */
+  /**
+   * Build one cloud group around a meandering corridor — the helicopter-game
+   * feel. The corridor centre drifts via a bounded random walk, and each group
+   * is randomly one of: a full top+bottom wall corridor, a single wall to fly
+   * over/under, or free-floating mid clouds. The result is an unpredictable,
+   * naturally flowing course rather than evenly-placed mid-screen puffs.
+   */
   private buildBands(): CloudBand[] {
     const pTop = MARGIN;
     const pBot = H - GROUND_H - MARGIN;
     const playH = pBot - pTop;
     const minGap = this.level.minGap;
+    const cw = () => Math.min(CLOUD_W_MAX, 48 + Math.random() * (24 + this.level.index * 5));
 
-    // Clamp the band count so (n+1) minimum gaps + n thin clouds still fit.
-    let n = this.cloudCountFor();
-    while (n > 1 && (n + 1) * minGap + n * MIN_CLOUD_H > playH) n--;
+    // Meander the corridor centre (bounded random walk) for a flowing path.
+    const drift = 34 + this.level.index * 7;
+    this.corridorY += (Math.random() - 0.5) * 2 * drift;
 
-    // Cloud heights vary widely and grow chunkier in later levels; the cap
-    // keeps them cloud-shaped rather than wall-like.
-    const grow = 24 + this.level.index * 9;
-    let thick: number[] = [];
-    for (let i = 0; i < n; i++) {
-      thick.push(Math.min(MAX_CLOUD_H, MIN_CLOUD_H + Math.random() * grow));
+    // Corridor opening: wide early, tightening at higher levels, with variety.
+    const extra = Math.max(24, playH * (0.6 - this.level.index * 0.06));
+    const gap = minGap + Math.random() * extra;
+    const half = gap / 2;
+    this.corridorY = Math.max(pTop + half, Math.min(pBot - half, this.corridorY));
+    const cTop = this.corridorY - half;
+    const cBot = this.corridorY + half;
+
+    // Pick which walls exist. Full corridors get more common as levels climb;
+    // early on, single walls and floating clouds dominate (fly over/under).
+    const bothP = 0.28 + this.level.index * 0.07;
+    const singleP = 0.34;
+    const roll = Math.random();
+    let topWall = false;
+    let botWall = false;
+    if (roll < bothP) {
+      topWall = true;
+      botWall = true;
+    } else if (roll < bothP + singleP) {
+      if (Math.random() < 0.5) topWall = true;
+      else botWall = true;
     }
-    // If the clouds leave too little room for gaps, shrink them to fit.
-    const need = (n + 1) * minGap;
-    let sumThick = thick.reduce((a, b) => a + b, 0);
-    if (playH - sumThick < need) {
-      const scale = Math.max(0, playH - need) / (sumThick || 1);
-      thick = thick.map((t) => Math.max(10, t * scale));
-      sumThick = thick.reduce((a, b) => a + b, 0);
-    }
-
-    // Distribute the leftover slack unevenly across the n+1 gaps so clouds
-    // land at varying heights (high, low, off-center) rather than mid-screen.
-    // Squaring the weights makes one gap tend to dominate → bigger swings.
-    const slack = Math.max(0, playH - sumThick - need);
-    const w = Array.from({ length: n + 1 }, () => Math.random() ** 2 + 0.05);
-    const wsum = w.reduce((a, b) => a + b, 0) || 1;
-    const gaps = w.map((x) => minGap + (x / wsum) * slack);
 
     const bands: CloudBand[] = [];
-    let y = pTop;
-    for (let i = 0; i < n; i++) {
-      y += gaps[i];
-      const cw = Math.min(CLOUD_W_MAX, 44 + Math.random() * (24 + this.level.index * 5));
-      bands.push({ top: y, bot: y + thick[i], w: cw, seed: Math.random() });
-      y += thick[i];
+    if (topWall && cTop - pTop > 12) bands.push({ top: pTop, bot: cTop, w: cw(), seed: Math.random() });
+    if (botWall && pBot - cBot > 12) bands.push({ top: cBot, bot: pBot, w: cw(), seed: Math.random() });
+
+    if (!topWall && !botWall) {
+      // Free-floating cloud(s) around the corridor centre — open above & below.
+      const th = Math.min(MAX_CLOUD_H, MIN_CLOUD_H + Math.random() * (28 + this.level.index * 8));
+      bands.push({ top: this.corridorY - th / 2, bot: this.corridorY + th / 2, w: cw(), seed: Math.random() });
+      // A second, well-separated puff on busier levels.
+      if (this.level.index >= 3 && Math.random() < 0.45) {
+        const off = (Math.random() < 0.5 ? -1 : 1) * (minGap + 24 + Math.random() * 46);
+        const ny = Math.max(pTop + 8, Math.min(pBot - 8, this.corridorY + off));
+        const th2 = MIN_CLOUD_H + Math.random() * 22;
+        bands.push({ top: ny - th2 / 2, bot: ny + th2 / 2, w: cw(), seed: Math.random() });
+      }
+    } else if (topWall && botWall && this.level.index >= 4 && Math.random() < 0.3) {
+      // "Pinch": a floating nub inside the corridor, placed only where both
+      // resulting sub-gaps stay >= minGap so the column is always passable.
+      const nub = 14 + Math.random() * 16;
+      const lo = cTop + minGap + nub / 2;
+      const hi = cBot - minGap - nub / 2;
+      if (hi > lo) {
+        const ny = lo + Math.random() * (hi - lo);
+        bands.push({ top: ny - nub / 2, bot: ny + nub / 2, w: cw() * 0.8, seed: Math.random() });
+      }
     }
+
     return bands;
   }
 
@@ -298,7 +319,7 @@ export class GameEngine {
     if (this.obstacles.length && this.obstacles[0].x < -CLOUD_W_MAX) this.obstacles.shift();
     this.batteries = this.batteries.filter((b) => b.x > -BATTERY_R * 2 && !b.collected);
     const last = this.obstacles[this.obstacles.length - 1];
-    if (last && last.x < W - this.level.spacing) this.spawnObstacle(last.x + this.level.spacing);
+    if (last && last.x < W) this.spawnObstacle(last.x + this.nextAdvance());
 
     // Drift the captured-energy pops upward and fade them out.
     for (const p of this.pops) {
@@ -536,48 +557,48 @@ export class GameEngine {
     }
   }
 
-  /** Draw one free-floating cloud as a lumpy blob with open sky all around. */
+  /**
+   * Draw a cloud band as a vertical stack of overlapping puffs. A thin band
+   * reads as one fluffy cloud; a tall, edge-anchored band reads as a grouped
+   * cloud wall jutting from the ceiling or floor.
+   */
   private renderCloud(x: number, band: CloudBand, lvl: LevelTheme) {
     const ctx = this.ctx;
     const h = band.bot - band.top;
     if (h <= 0) return;
     const cx = x + band.w / 2;
-    const cy = (band.top + band.bot) / 2;
-    const rx = band.w / 2;
-    const ry = h / 2;
+    const r = band.w / 2; // puff radius
+    const usable = Math.max(0, h - r); // vertical travel for puff centres
+    const n = Math.max(1, Math.round(usable / (r * 0.7)) + 1);
 
-    // Shadowed underbelly: same blob nudged down, drawn first.
-    ctx.fillStyle = lvl.cloudShade;
-    this.blob(cx, cy + 3, rx, ry, band.seed);
-    // Main puff.
-    ctx.fillStyle = lvl.cloud;
-    this.blob(cx, cy, rx, ry, band.seed);
-    // Soft highlight near the top-left for a little volume.
+    const layer = (color: string, dy: number) => {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const t = n === 1 ? 0.5 : i / (n - 1);
+        const cy = band.top + r * 0.5 + usable * t + dy;
+        const ox = Math.sin(band.seed * 12 + i * 1.9) * r * 0.28;
+        const pr = r * (0.82 + 0.18 * Math.sin(band.seed * 5 + i * 1.3));
+        ctx.moveTo(cx + ox + pr, cy);
+        ctx.arc(cx + ox, cy, pr, 0, Math.PI * 2);
+      }
+      ctx.fill();
+    };
+    layer(lvl.cloudShade, 3); // shadowed underbelly
+    layer(lvl.cloud, 0); // main body
+
+    // Soft highlights for a little volume.
     ctx.save();
-    ctx.globalAlpha = 0.5;
+    ctx.globalAlpha = 0.45;
     ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.arc(cx - rx * 0.3, cy - ry * 0.35, Math.max(3, ry * 0.4), 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  /** A cluster of overlapping circles filling an ellipse → a fluffy cloud. */
-  private blob(cx: number, cy: number, rx: number, ry: number, seed: number) {
-    const ctx = this.ctx;
-    const lobes = 5;
-    ctx.beginPath();
-    // Central mass keeps thin bands from looking like a dotted line.
-    ctx.ellipse(cx, cy, rx * 0.82, ry * 0.78, 0, 0, Math.PI * 2);
-    for (let i = 0; i < lobes; i++) {
-      const a = (i / lobes) * Math.PI * 2 + seed * 6;
-      const px = cx + Math.cos(a) * rx * 0.55;
-      const py = cy + Math.sin(a) * ry * 0.5;
-      const r = (0.42 + ((Math.sin(seed * 12 + i) + 1) / 2) * 0.22) * Math.min(rx, ry + 6);
-      ctx.moveTo(px + r, py);
-      ctx.arc(px, py, r, 0, Math.PI * 2);
+    for (let i = 0; i < n; i += 2) {
+      const t = n === 1 ? 0.5 : i / (n - 1);
+      const cy = band.top + r * 0.5 + usable * t;
+      ctx.beginPath();
+      ctx.arc(cx - r * 0.3, cy - r * 0.3, Math.max(2, r * 0.3), 0, Math.PI * 2);
+      ctx.fill();
     }
-    ctx.fill();
+    ctx.restore();
   }
 
   private renderBatteries() {
