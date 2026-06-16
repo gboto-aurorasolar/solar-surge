@@ -558,59 +558,76 @@ export class GameEngine {
   }
 
   /**
-   * Draw a cloud band as one cohesive fluffy mass. Lobes are wider than tall
-   * and overlap heavily, then get unioned into a single silhouette so the
-   * band reads as a cloud — not a stack of separate bubbles. A darker back
-   * layer (the canvas stand-in for z-order between overlapping puffs) and a
-   * single soft highlight give it volume. Thin bands become one flat puff;
-   * tall edge-anchored bands become a grouped cloud wall.
+   * Draw a cloud band as a flat-design cartoon cloud: a flat base with a
+   * lumpy edge of overlapping circles (bigger toward the middle) facing the
+   * open gap. Ceiling-anchored clouds bump downward, floor/floating clouds
+   * bump upward — so corridors look like clouds above and below. A soft
+   * offset drop shadow keeps the classic-game flat-vector aesthetic.
    */
   private renderCloud(x: number, band: CloudBand, lvl: LevelTheme) {
     const ctx = this.ctx;
     const h = band.bot - band.top;
     if (h <= 0) return;
-    const cx = x + band.w / 2;
-    const halfW = band.w / 2;
+    const pTopEdge = MARGIN;
+    const pBotEdge = H - GROUND_H - MARGIN;
+    const left = x;
+    const right = x + band.w;
+    const ceilingAnchored = band.top <= pTopEdge + 2;
+    const floorAnchored = band.bot >= pBotEdge - 2;
+    const isFloat = !ceilingAnchored && !floorAnchored;
+    const bumpsDown = ceilingAnchored && !floorAnchored; // bumps face the gap
 
-    // Lobes are clearly wider than tall; shrink to fit short bands.
-    const ry = Math.max(8, Math.min(halfW * 0.7, h / 2));
-    const step = ry * 0.7; // heavy vertical overlap → lobes merge cleanly
+    const r = Math.max(8, band.w * 0.32); // base bump radius
+    const flatY = bumpsDown ? band.top : band.bot; // anchored / flat edge
+    const dir = bumpsDown ? -1 : 1; // step from the gap edge toward the flat edge
+    const firstY = bumpsDown ? band.bot - r : band.top + r; // gap-facing bump row
 
-    type Lobe = { x: number; y: number; rx: number; ry: number };
-    const lobes: Lobe[] = [];
-    const topC = band.top + ry;
-    const botC = Math.max(topC, band.bot - ry);
-    let k = 0;
-    for (let cy = topC; ; cy += step, k++) {
-      const cyc = Math.min(cy, botC);
-      // Gentle side wander keeps the silhouette bumpy without leaving notches.
-      const ox = Math.sin(band.seed * 9 + k * 2.3) * halfW * 0.22;
-      const wob = 0.86 + 0.22 * Math.abs(Math.sin(band.seed * 3.1 + k * 1.7));
-      lobes.push({ x: cx + ox, y: cyc, rx: halfW * wob, ry: ry * (0.92 + 0.12 * Math.sin(band.seed + k)) });
-      if (cyc >= botC) break;
+    type B = { x: number; y: number; r: number };
+    const bumps: B[] = [];
+    // Lay down rows of wide bumps from the gap-facing edge inward; rows
+    // interlock so a tall band reads as a piled cloud bank, and a short band
+    // as a single puffy cloud. Bumps are largest toward the middle/gap edge.
+    const span = Math.max(0, band.w - r * 1.2);
+    const count = Math.max(2, Math.round(band.w / r));
+    const rowStep = r * 1.15;
+    const rows = Math.max(1, Math.round(h / rowStep));
+    for (let row = 0; row < rows; row++) {
+      let ly = firstY + dir * row * rowStep;
+      ly = bumpsDown ? Math.max(ly, band.top + r * 0.5) : Math.min(ly, band.bot - r * 0.5);
+      const phase = row * 0.7;
+      for (let i = 0; i < count; i++) {
+        const t = count === 1 ? 0.5 : i / (count - 1);
+        const bx = left + r * 0.6 + t * span + Math.sin(phase + i) * r * 0.14;
+        const mid = 1 - Math.abs(t - 0.5) * 1.2; // peak toward the centre
+        let br = r * (0.6 + 0.45 * Math.max(0, mid));
+        br *= 0.82 + 0.3 * Math.abs(Math.sin(band.seed * 7 + i * 2.1 + phase));
+        if (row > 0) br *= 0.92; // gap-facing row stays the puffiest
+        const jit = Math.sin(band.seed * 5 + i * 1.3 + phase) * r * 0.16;
+        bumps.push({ x: bx, y: ly + jit, r: Math.max(5, br) });
+      }
+      if (bumpsDown ? ly <= band.top + r * 0.6 : ly >= band.bot - r * 0.6) break;
+    }
+    // Round the two corners of a free-floating cloud's flat base.
+    if (isFloat) {
+      const fr = r * 0.7;
+      bumps.push({ x: left + fr, y: flatY - dir * fr * 0.55, r: fr });
+      bumps.push({ x: right - fr, y: flatY - dir * fr * 0.55, r: fr });
     }
 
-    const fillMass = (color: string, dy: number) => {
+    const paint = (color: string, dx: number, dy: number) => {
       ctx.fillStyle = color;
       ctx.beginPath();
-      for (const l of lobes) ctx.ellipse(l.x, l.y + dy, l.rx, l.ry, 0, 0, Math.PI * 2);
+      const inset = Math.min(r * 0.5, band.w * 0.25);
+      ctx.rect(left + inset + dx, band.top + dy, band.w - inset * 2, h); // core hidden behind bumps
+      for (const b of bumps) {
+        ctx.moveTo(b.x + b.r + dx, b.y + dy);
+        ctx.arc(b.x + dx, b.y + dy, b.r, 0, Math.PI * 2);
+      }
       ctx.fill();
     };
 
-    // Shade drawn straight below the body → a clean underbelly, no inner seams.
-    fillMass(lvl.cloudShade, Math.min(5, ry * 0.3));
-    // Main fluffy body.
-    fillMass(lvl.cloud, 0);
-
-    // One soft highlight near the top of the mass.
-    const t = lobes[0];
-    ctx.save();
-    ctx.globalAlpha = 0.28;
-    ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.ellipse(t.x - t.rx * 0.22, t.y - t.ry * 0.2, t.rx * 0.6, t.ry * 0.5, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
+    paint(lvl.cloudShade, 2, 4); // flat-design drop shadow
+    paint(lvl.cloud, 0, 0); // cloud body
   }
 
   private renderBatteries() {
