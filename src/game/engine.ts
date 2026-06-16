@@ -558,76 +558,108 @@ export class GameEngine {
   }
 
   /**
-   * Draw a cloud band as a flat-design cartoon cloud: a flat base with a
-   * lumpy edge of overlapping circles (bigger toward the middle) facing the
-   * open gap. Ceiling-anchored clouds bump downward, floor/floating clouds
-   * bump upward — so corridors look like clouds above and below. A soft
-   * offset drop shadow keeps the classic-game flat-vector aesthetic.
+   * Render a cloud band as a vertical STACK of distinct cartoon clouds. Each
+   * cloud's width, height, horizontal offset and bump pattern are derived from
+   * the band seed, so no two repeat; every cloud stays wider than tall. A tall
+   * band (wall/corridor side) becomes a varied column of clouds. Drawn
+   * top-to-bottom so lower clouds overlap the ones behind.
    */
   private renderCloud(x: number, band: CloudBand, lvl: LevelTheme) {
-    const ctx = this.ctx;
     const h = band.bot - band.top;
     if (h <= 0) return;
-    const pTopEdge = MARGIN;
-    const pBotEdge = H - GROUND_H - MARGIN;
-    const left = x;
-    const right = x + band.w;
-    const ceilingAnchored = band.top <= pTopEdge + 2;
-    const floorAnchored = band.bot >= pBotEdge - 2;
-    const isFloat = !ceilingAnchored && !floorAnchored;
-    const bumpsDown = ceilingAnchored && !floorAnchored; // bumps face the gap
+    const w0 = band.w;
+    const rand = (k: number) => {
+      const v = Math.sin(band.seed * 12.9898 + k * 78.233) * 43758.5453;
+      return v - Math.floor(v);
+    };
 
-    const r = Math.max(8, band.w * 0.32); // base bump radius
-    const flatY = bumpsDown ? band.top : band.bot; // anchored / flat edge
-    const dir = bumpsDown ? -1 : 1; // step from the gap edge toward the flat edge
-    const firstY = bumpsDown ? band.bot - r : band.top + r; // gap-facing bump row
+    type Spec = { cx: number; baseY: number; w: number; hgt: number; seed: number };
+    const specs: Spec[] = [];
+    let y = band.bot;
+    for (let i = 0; i < 16 && y > band.top + 6; i++) {
+      let hgt = Math.min(w0 * 0.46, h) * (0.68 + rand(i * 7 + 1) * 0.6); // varied height
+      hgt = Math.max(14, hgt);
+      const w = Math.max(hgt * 1.7, w0 * (0.78 + rand(i * 7 + 2) * 0.5)); // always wider than tall
+      const cx = x + w0 / 2 + (rand(i * 7 + 3) - 0.5) * w0 * 0.38; // wander left/right
+      specs.push({ cx, baseY: y, w, hgt, seed: band.seed + i * 1.913 });
+      y -= hgt * (0.5 + rand(i * 7 + 4) * 0.28); // varied overlap up the stack
+    }
+    for (let k = specs.length - 1; k >= 0; k--) {
+      const s = specs[k];
+      this.drawCloud(s.cx, s.baseY, s.w, s.hgt, s.seed, lvl);
+    }
+  }
+
+  /**
+   * One cartoon cloud: flat bottom (hard-clipped), poofy on the top and both
+   * sides via a ring of varied bumps, a soft drop shadow, and pixelated darker
+   * line-work inside (underside shade + contour arcs) for extra cloud detail.
+   */
+  private drawCloud(cx: number, baseY: number, w: number, hgt: number, seed: number, lvl: LevelTheme) {
+    const ctx = this.ctx;
+    const rand = (k: number) => {
+      const v = Math.sin(seed * 12.9898 + k * 78.233) * 43758.5453;
+      return v - Math.floor(v);
+    };
+    const left = cx - w / 2;
+    const cyc = baseY - hgt * 0.5; // centre of the poof mass
+    const a = w * 0.42; // horizontal placement radius
+    const b = hgt * 0.55; // vertical placement radius
 
     type B = { x: number; y: number; r: number };
     const bumps: B[] = [];
-    // Lay down rows of wide bumps from the gap-facing edge inward; rows
-    // interlock so a tall band reads as a piled cloud bank, and a short band
-    // as a single puffy cloud. Bumps are largest toward the middle/gap edge.
-    const span = Math.max(0, band.w - r * 1.2);
-    const count = Math.max(2, Math.round(band.w / r));
-    const rowStep = r * 1.15;
-    const rows = Math.max(1, Math.round(h / rowStep));
-    for (let row = 0; row < rows; row++) {
-      let ly = firstY + dir * row * rowStep;
-      ly = bumpsDown ? Math.max(ly, band.top + r * 0.5) : Math.min(ly, band.bot - r * 0.5);
-      const phase = row * 0.7;
-      for (let i = 0; i < count; i++) {
-        const t = count === 1 ? 0.5 : i / (count - 1);
-        const bx = left + r * 0.6 + t * span + Math.sin(phase + i) * r * 0.14;
-        const mid = 1 - Math.abs(t - 0.5) * 1.2; // peak toward the centre
-        let br = r * (0.6 + 0.45 * Math.max(0, mid));
-        br *= 0.82 + 0.3 * Math.abs(Math.sin(band.seed * 7 + i * 2.1 + phase));
-        if (row > 0) br *= 0.92; // gap-facing row stays the puffiest
-        const jit = Math.sin(band.seed * 5 + i * 1.3 + phase) * r * 0.16;
-        bumps.push({ x: bx, y: ly + jit, r: Math.max(5, br) });
-      }
-      if (bumpsDown ? ly <= band.top + r * 0.6 : ly >= band.bot - r * 0.6) break;
-    }
-    // Round the two corners of a free-floating cloud's flat base.
-    if (isFloat) {
-      const fr = r * 0.7;
-      bumps.push({ x: left + fr, y: flatY - dir * fr * 0.55, r: fr });
-      bumps.push({ x: right - fr, y: flatY - dir * fr * 0.55, r: fr });
+    const K = 4 + Math.floor(rand(1) * 4); // 4–7 bumps, varies per cloud
+    for (let k = 0; k < K; k++) {
+      const f = (k + 0.5) / K;
+      // Sweep from lower-left, over the top, to lower-right — top + sides only.
+      const ang = Math.PI * 0.86 + f * Math.PI * 1.28 + (rand(k * 5 + 9) - 0.5) * 0.3;
+      const topFactor = 0.5 - 0.5 * Math.sin(ang); // 1 at the top, 0 at the sides
+      const br = Math.min(w, hgt * 2) * 0.27 * (0.65 + 0.6 * topFactor) * (0.82 + rand(k * 5 + 3) * 0.5);
+      bumps.push({ x: cx + Math.cos(ang) * a, y: cyc + Math.sin(ang) * b, r: Math.max(6, br) });
     }
 
-    const paint = (color: string, dx: number, dy: number) => {
-      ctx.fillStyle = color;
+    const path = (dx: number, dy: number) => {
       ctx.beginPath();
-      const inset = Math.min(r * 0.5, band.w * 0.25);
-      ctx.rect(left + inset + dx, band.top + dy, band.w - inset * 2, h); // core hidden behind bumps
-      for (const b of bumps) {
-        ctx.moveTo(b.x + b.r + dx, b.y + dy);
-        ctx.arc(b.x + dx, b.y + dy, b.r, 0, Math.PI * 2);
+      ctx.rect(left + dx, cyc + dy, w, baseY - cyc); // solid core down to the flat base
+      for (const bp of bumps) {
+        ctx.moveTo(bp.x + bp.r + dx, bp.y + dy);
+        ctx.arc(bp.x + dx, bp.y + dy, bp.r, 0, Math.PI * 2);
       }
-      ctx.fill();
     };
 
-    paint(lvl.cloudShade, 2, 4); // flat-design drop shadow
-    paint(lvl.cloud, 0, 0); // cloud body
+    // Soft drop shadow (unclipped so it shows beneath the flat base).
+    ctx.fillStyle = 'rgba(20,28,40,0.16)';
+    path(3, 5);
+    ctx.fill();
+
+    // Body — clipped to y <= baseY so the bottom edge is perfectly flat.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(left - w, cyc - hgt * 2, w * 3, baseY - (cyc - hgt * 2));
+    ctx.clip();
+    ctx.fillStyle = lvl.cloud;
+    path(0, 0);
+    ctx.fill();
+
+    // Interior detail, clipped to the cloud silhouette.
+    path(0, 0);
+    ctx.clip();
+    // Shaded underbelly strip.
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = lvl.cloudShade;
+    ctx.fillRect(left - w, baseY - Math.max(5, hgt * 0.28), w * 3, hgt);
+    ctx.globalAlpha = 1;
+    // Pixelated darker contour arcs under a few poofs for inner cloud detail.
+    ctx.strokeStyle = lvl.cloudShade;
+    ctx.lineWidth = 1;
+    for (let k = 0; k < bumps.length; k++) {
+      if (rand(k * 9 + 5) < 0.45) continue;
+      const bp = bumps[k];
+      ctx.beginPath();
+      ctx.arc(bp.x, bp.y, Math.max(4, bp.r * 0.8), Math.PI * 0.12, Math.PI * 0.88);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private renderBatteries() {
