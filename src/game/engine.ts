@@ -17,6 +17,8 @@ const MARGIN = 22; // keep openings reachable away from ceiling/ground
 const MIN_CLOUD_H = 14; // thinnest a cloud band can shrink to
 const MAX_CLOUD_H = 70; // keep clouds puffy rather than wall-like
 const BATTERY_R = 9; // collision radius of a floating battery
+const MULT_MAX = 5; // highest battery combo multiplier
+const MULT_TIME = 6; // seconds a multiplier lasts before decaying to 1
 
 // One game-second models a few real minutes of generation so the kWh
 // figures feel rewarding while staying honestly labelled.
@@ -77,6 +79,9 @@ export class GameEngine {
   private batteriesCollected = 0;
   private storageKwh = 0;
   private sinceBattery = 0; // obstacles spawned since the last battery
+  private comboMult = 1; // battery-fuelled score multiplier (1..MULT_MAX)
+  private multTimer = 0; // seconds left before the multiplier decays to 1
+  private maxMult = 1; // highest multiplier reached this run
   private level: LevelTheme = LEVELS[0];
   private statsAccum = 0;
   private grace = 0; // seconds the sun hovers before gravity kicks in
@@ -151,6 +156,9 @@ export class GameEngine {
     this.batteriesCollected = 0;
     this.storageKwh = 0;
     this.sinceBattery = 0;
+    this.comboMult = 1;
+    this.multTimer = 0;
+    this.maxMult = 1;
     this.thrusting = false;
     this.level = LEVELS[0];
     let x = W + 80;
@@ -314,8 +322,15 @@ export class GameEngine {
       return;
     }
 
+    // Battery combo multiplier decays back to 1 when its timer runs out.
+    if (this.multTimer > 0) {
+      this.multTimer = Math.max(0, this.multTimer - dt);
+      if (this.multTimer === 0) this.comboMult = 1;
+    }
+
     this.distance += (speed * dt) / 10; // ~metres
-    this.energy += (this.level.powerKw * dt * TIME_SCALE) / 3600;
+    // Stored battery charge amplifies output while the combo is live.
+    this.energy += ((this.level.powerKw * dt * TIME_SCALE) / 3600) * this.comboMult;
 
     // Physics.
     this.vy += (GRAVITY - (this.thrusting ? THRUST : 0)) * dt;
@@ -337,7 +352,7 @@ export class GameEngine {
     for (const o of this.obstacles) {
       if (!o.passed && o.x + CLOUD_W < SUN_X) {
         o.passed = true;
-        this.energy += 0.5 * this.level.index;
+        this.energy += 0.5 * this.level.index * this.comboMult;
         this.sfx.point();
       }
     }
@@ -353,8 +368,17 @@ export class GameEngine {
         this.energy += b.value;
         this.storageKwh += b.value;
         this.batteriesCollected++;
+        // Each capture steps up the score multiplier and refreshes its timer.
+        this.comboMult = Math.min(MULT_MAX, this.comboMult + 1);
+        this.multTimer = MULT_TIME;
+        this.maxMult = Math.max(this.maxMult, this.comboMult);
         this.sfx.battery();
-        this.pops.push({ x: b.x, y: by - BATTERY_R - 4, life: 1, text: `+${b.value.toFixed(0)} kWh` });
+        this.pops.push({
+          x: b.x,
+          y: by - BATTERY_R - 4,
+          life: 1.3,
+          text: `+${b.value.toFixed(0)} kWh  x${this.comboMult}`,
+        });
       }
     }
 
@@ -403,6 +427,7 @@ export class GameEngine {
       isHighScore,
       batteries: this.batteriesCollected,
       storageKwh: this.storageKwh,
+      maxMultiplier: this.maxMult,
       ...conv,
     };
     this.emitStats();
@@ -415,7 +440,7 @@ export class GameEngine {
       distanceM: this.distance,
       powerKw: this.level.powerKw,
       level: this.level,
-      multiplier: this.level.index,
+      multiplier: this.comboMult,
       batteries: this.batteriesCollected,
       storageKwh: this.storageKwh,
     };
@@ -705,6 +730,31 @@ export class GameEngine {
         ctx.fillStyle = '#9CF5C9';
         ctx.font = '9px monospace';
         ctx.fillText(`x${this.batteriesCollected}  +${this.storageKwh.toFixed(0)} kWh`, 30, 41);
+      }
+
+      // Active battery combo multiplier: bold badge + draining timer bar.
+      if (this.comboMult > 1) {
+        const bw = 96;
+        const bx = (W - bw) / 2;
+        const pulse = 0.7 + ((Math.sin(this.bob * 10) + 1) / 2) * 0.3;
+        ctx.save();
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = 'rgba(14,61,43,0.85)';
+        ctx.fillRect(bx, 8, bw, 24);
+        ctx.fillStyle = '#27E08A';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.font = '14px monospace';
+        ctx.fillText(`x${this.comboMult} OUTPUT`, W / 2, 12);
+        // Timer bar drains left→right as the combo expires.
+        const frac = Math.max(0, this.multTimer / MULT_TIME);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillRect(bx, 28, bw, 3);
+        ctx.fillStyle = '#9CF5C9';
+        ctx.fillRect(bx, 28, bw * frac, 3);
+        ctx.restore();
+        ctx.textAlign = 'left';
       }
     }
     if (this.flash > 0) {

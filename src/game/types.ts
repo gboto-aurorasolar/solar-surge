@@ -55,6 +55,8 @@ export interface RunSummary {
   batteries: number;
   /** Bonus kWh banked from captured batteries */
   storageKwh: number;
+  /** Highest score multiplier reached via battery combos */
+  maxMultiplier: number;
 }
 
 export interface EngineCallbacks {

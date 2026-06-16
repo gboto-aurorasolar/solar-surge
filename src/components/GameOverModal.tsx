@@ -50,6 +50,7 @@ export function GameOverModal({
                 <x.p mt={1} mb={0} color="uiSuccess" text="body12">
                   🔋 Captured {summary.batteries} storage{' '}
                   {summary.batteries === 1 ? 'battery' : 'batteries'} · +{fmt(summary.storageKwh, 1)} kWh banked
+                  {summary.maxMultiplier > 1 && ` · peak x${summary.maxMultiplier} output`}
                 </x.p>
               )}
             </x.div>
