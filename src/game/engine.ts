@@ -12,10 +12,11 @@ const GRAVITY = 430; // px/s^2, always pulling the sun down
 const THRUST = 760; // px/s^2 applied upward while held
 const MAX_VY = 300;
 const GROUND_H = 48; // panel strip height at the bottom
-const CLOUD_W = 54; // width of a free-floating cloud band
+const CLOUD_W = 54; // nominal cloud width (used for column spacing/scoring)
+const CLOUD_W_MAX = 90; // widest a cloud can be — used for off-screen culling
 const MARGIN = 22; // keep openings reachable away from ceiling/ground
-const MIN_CLOUD_H = 14; // thinnest a cloud band can shrink to
-const MAX_CLOUD_H = 70; // keep clouds puffy rather than wall-like
+const MIN_CLOUD_H = 18; // thinnest a cloud band can shrink to
+const MAX_CLOUD_H = 78; // keep clouds puffy rather than wall-like
 const BATTERY_R = 9; // collision radius of a floating battery
 const MULT_MAX = 5; // highest battery combo multiplier
 const MULT_TIME = 6; // seconds a multiplier lasts before decaying to 1
@@ -28,6 +29,8 @@ const TIME_SCALE = 150;
 interface CloudBand {
   top: number;
   bot: number;
+  /** Width of this cloud (varies per cloud so sizes differ). */
+  w: number;
   /** Per-puff radius jitter so each band renders as a distinct fluffy blob. */
   seed: number;
 }
@@ -193,8 +196,9 @@ export class GameEngine {
     let n = this.cloudCountFor();
     while (n > 1 && (n + 1) * minGap + n * MIN_CLOUD_H > playH) n--;
 
-    // Clouds grow chunkier in later levels; cap so they stay cloud-shaped.
-    const grow = 16 + this.level.index * 6;
+    // Cloud heights vary widely and grow chunkier in later levels; the cap
+    // keeps them cloud-shaped rather than wall-like.
+    const grow = 24 + this.level.index * 9;
     let thick: number[] = [];
     for (let i = 0; i < n; i++) {
       thick.push(Math.min(MAX_CLOUD_H, MIN_CLOUD_H + Math.random() * grow));
@@ -204,13 +208,15 @@ export class GameEngine {
     let sumThick = thick.reduce((a, b) => a + b, 0);
     if (playH - sumThick < need) {
       const scale = Math.max(0, playH - need) / (sumThick || 1);
-      thick = thick.map((t) => Math.max(8, t * scale));
+      thick = thick.map((t) => Math.max(10, t * scale));
       sumThick = thick.reduce((a, b) => a + b, 0);
     }
 
-    // Distribute the leftover slack randomly across the n+1 gaps.
+    // Distribute the leftover slack unevenly across the n+1 gaps so clouds
+    // land at varying heights (high, low, off-center) rather than mid-screen.
+    // Squaring the weights makes one gap tend to dominate → bigger swings.
     const slack = Math.max(0, playH - sumThick - need);
-    const w = Array.from({ length: n + 1 }, () => Math.random());
+    const w = Array.from({ length: n + 1 }, () => Math.random() ** 2 + 0.05);
     const wsum = w.reduce((a, b) => a + b, 0) || 1;
     const gaps = w.map((x) => minGap + (x / wsum) * slack);
 
@@ -218,7 +224,8 @@ export class GameEngine {
     let y = pTop;
     for (let i = 0; i < n; i++) {
       y += gaps[i];
-      bands.push({ top: y, bot: y + thick[i], seed: Math.random() });
+      const cw = Math.min(CLOUD_W_MAX, 44 + Math.random() * (24 + this.level.index * 5));
+      bands.push({ top: y, bot: y + thick[i], w: cw, seed: Math.random() });
       y += thick[i];
     }
     return bands;
@@ -236,8 +243,8 @@ export class GameEngine {
    * detour that rewards precise flying (think of a 1-up in a tricky nook).
    */
   private maybeSpawnBattery(x: number, bands: CloudBand[]) {
-    if (this.sinceBattery < 2) return; // never back-to-back
-    if (Math.random() > 0.45) return;
+    if (this.sinceBattery < 4) return; // keep a wide spacing between prizes
+    if (Math.random() > 0.22) return;
 
     const pTop = MARGIN;
     const pBot = H - GROUND_H - MARGIN;
@@ -288,7 +295,7 @@ export class GameEngine {
     const dx = speed * dt;
     for (const o of this.obstacles) o.x -= dx;
     for (const b of this.batteries) b.x -= dx;
-    if (this.obstacles.length && this.obstacles[0].x < -CLOUD_W) this.obstacles.shift();
+    if (this.obstacles.length && this.obstacles[0].x < -CLOUD_W_MAX) this.obstacles.shift();
     this.batteries = this.batteries.filter((b) => b.x > -BATTERY_R * 2 && !b.collected);
     const last = this.obstacles[this.obstacles.length - 1];
     if (last && last.x < W - this.level.spacing) this.spawnObstacle(last.x + this.level.spacing);
@@ -400,9 +407,11 @@ export class GameEngine {
     // Circle-vs-rounded-band test, inset slightly so the puffy edges feel fair.
     const pad = 3;
     for (const o of this.obstacles) {
-      if (SUN_X + SUN_R < o.x + pad || SUN_X - SUN_R > o.x + CLOUD_W - pad) continue;
       for (const band of o.bands) {
-        const cx = Math.max(o.x + pad, Math.min(SUN_X, o.x + CLOUD_W - pad));
+        const left = o.x + pad;
+        const right = o.x + band.w - pad;
+        if (SUN_X + SUN_R < left || SUN_X - SUN_R > right) continue;
+        const cx = Math.max(left, Math.min(SUN_X, right));
         const cy = Math.max(band.top + pad, Math.min(this.sunY, band.bot - pad));
         const ddx = SUN_X - cx;
         const ddy = this.sunY - cy;
@@ -532,9 +541,9 @@ export class GameEngine {
     const ctx = this.ctx;
     const h = band.bot - band.top;
     if (h <= 0) return;
-    const cx = x + CLOUD_W / 2;
+    const cx = x + band.w / 2;
     const cy = (band.top + band.bot) / 2;
-    const rx = CLOUD_W / 2;
+    const rx = band.w / 2;
     const ry = h / 2;
 
     // Shadowed underbelly: same blob nudged down, drawn first.
