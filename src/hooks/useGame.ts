@@ -12,6 +12,8 @@ const INITIAL_STATS: LiveStats = {
   powerKw: LEVELS[0].powerKw,
   level: LEVELS[0],
   multiplier: 1,
+  batteries: 0,
+  storageKwh: 0,
 };
 
 export function useGame() {

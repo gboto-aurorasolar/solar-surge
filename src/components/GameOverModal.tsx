@@ -46,6 +46,12 @@ export function GameOverModal({
               <x.p mt={2} mb={0} color="uiHelperCopy" text="body12">
                 Reached Level {summary.topLevel} · {titleCase(summary.topLevelTitle)}
               </x.p>
+              {summary.batteries > 0 && (
+                <x.p mt={1} mb={0} color="uiSuccess" text="body12">
+                  🔋 Captured {summary.batteries} storage{' '}
+                  {summary.batteries === 1 ? 'battery' : 'batteries'} · +{fmt(summary.storageKwh, 1)} kWh banked
+                </x.p>
+              )}
             </x.div>
 
             <DS.Divider />

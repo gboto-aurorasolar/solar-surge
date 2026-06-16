@@ -12,18 +12,46 @@ const GRAVITY = 430; // px/s^2, always pulling the sun down
 const THRUST = 760; // px/s^2 applied upward while held
 const MAX_VY = 300;
 const GROUND_H = 48; // panel strip height at the bottom
-const COL_W = 46;
-const MARGIN = 26; // keep gaps reachable away from ceiling/ground
+const CLOUD_W = 54; // width of a free-floating cloud band
+const MARGIN = 22; // keep openings reachable away from ceiling/ground
+const MIN_CLOUD_H = 14; // thinnest a cloud band can shrink to
+const MAX_CLOUD_H = 70; // keep clouds puffy rather than wall-like
+const BATTERY_R = 9; // collision radius of a floating battery
 
 // One game-second models a few real minutes of generation so the kWh
 // figures feel rewarding while staying honestly labelled.
 const TIME_SCALE = 150;
 
-interface Column {
+/** A vertical band of cloud within an obstacle column (open sky above/below). */
+interface CloudBand {
+  top: number;
+  bot: number;
+  /** Per-puff radius jitter so each band renders as a distinct fluffy blob. */
+  seed: number;
+}
+
+/** One scrolling column holding 1+ free-floating clouds with navigable gaps. */
+interface Obstacle {
   x: number;
-  gapY: number;
-  gap: number;
+  bands: CloudBand[];
   passed: boolean;
+}
+
+/** A collectible floating storage battery — fly into it to bank kWh. */
+interface Battery {
+  x: number;
+  y: number;
+  value: number; // kWh banked when captured
+  bob: number; // animation phase
+  collected: boolean;
+}
+
+/** Short-lived rising "+kWh" text shown when a battery is captured. */
+interface Pop {
+  x: number;
+  y: number;
+  life: number;
+  text: string;
 }
 
 export class GameEngine {
@@ -43,7 +71,12 @@ export class GameEngine {
   private bob = 0;
   private distance = 0;
   private energy = 0;
-  private columns: Column[] = [];
+  private obstacles: Obstacle[] = [];
+  private batteries: Battery[] = [];
+  private pops: Pop[] = [];
+  private batteriesCollected = 0;
+  private storageKwh = 0;
+  private sinceBattery = 0; // obstacles spawned since the last battery
   private level: LevelTheme = LEVELS[0];
   private statsAccum = 0;
   private grace = 0; // seconds the sun hovers before gravity kicks in
@@ -112,21 +145,118 @@ export class GameEngine {
     this.vy = 0;
     this.distance = 0;
     this.energy = 0;
-    this.columns = [];
+    this.obstacles = [];
+    this.batteries = [];
+    this.pops = [];
+    this.batteriesCollected = 0;
+    this.storageKwh = 0;
+    this.sinceBattery = 0;
     this.thrusting = false;
     this.level = LEVELS[0];
     let x = W + 80;
     for (let i = 0; i < 4; i++) {
-      this.columns.push(this.makeColumn(x));
+      this.spawnObstacle(x);
       x += this.level.spacing;
     }
   }
 
-  private makeColumn(x: number): Column {
-    const gap = this.level.gap;
-    const min = MARGIN + gap / 2;
-    const max = H - GROUND_H - MARGIN - gap / 2;
-    return { x, gap, gapY: min + Math.random() * (max - min), passed: false };
+  /** Number of cloud bands a column should hold, ramping with difficulty. */
+  private cloudCountFor(): number {
+    const last = LEVELS[LEVELS.length - 1];
+    let n = this.level.clouds;
+    // Keep ramping past the final authored level: one more band every ~700m.
+    if (this.level.index === last.index) {
+      n += Math.floor(Math.max(0, this.distance - last.startsAt) / 700);
+    }
+    n = Math.min(4, n);
+    // Per-column variety: occasionally ease off by one for breathing room.
+    if (n > 1 && Math.random() < 0.35) n -= 1;
+    return n;
+  }
+
+  /** Build a column of free-floating clouds that always leaves passable gaps. */
+  private buildBands(): CloudBand[] {
+    const pTop = MARGIN;
+    const pBot = H - GROUND_H - MARGIN;
+    const playH = pBot - pTop;
+    const minGap = this.level.minGap;
+
+    // Clamp the band count so (n+1) minimum gaps + n thin clouds still fit.
+    let n = this.cloudCountFor();
+    while (n > 1 && (n + 1) * minGap + n * MIN_CLOUD_H > playH) n--;
+
+    // Clouds grow chunkier in later levels; cap so they stay cloud-shaped.
+    const grow = 16 + this.level.index * 6;
+    let thick: number[] = [];
+    for (let i = 0; i < n; i++) {
+      thick.push(Math.min(MAX_CLOUD_H, MIN_CLOUD_H + Math.random() * grow));
+    }
+    // If the clouds leave too little room for gaps, shrink them to fit.
+    const need = (n + 1) * minGap;
+    let sumThick = thick.reduce((a, b) => a + b, 0);
+    if (playH - sumThick < need) {
+      const scale = Math.max(0, playH - need) / (sumThick || 1);
+      thick = thick.map((t) => Math.max(8, t * scale));
+      sumThick = thick.reduce((a, b) => a + b, 0);
+    }
+
+    // Distribute the leftover slack randomly across the n+1 gaps.
+    const slack = Math.max(0, playH - sumThick - need);
+    const w = Array.from({ length: n + 1 }, () => Math.random());
+    const wsum = w.reduce((a, b) => a + b, 0) || 1;
+    const gaps = w.map((x) => minGap + (x / wsum) * slack);
+
+    const bands: CloudBand[] = [];
+    let y = pTop;
+    for (let i = 0; i < n; i++) {
+      y += gaps[i];
+      bands.push({ top: y, bot: y + thick[i], seed: Math.random() });
+      y += thick[i];
+    }
+    return bands;
+  }
+
+  private spawnObstacle(x: number) {
+    const bands = this.buildBands();
+    this.obstacles.push({ x, bands, passed: false });
+    this.sinceBattery++;
+    this.maybeSpawnBattery(x, bands);
+  }
+
+  /**
+   * Tuck a battery into the tightest navigable gap of a column — a deliberate
+   * detour that rewards precise flying (think of a 1-up in a tricky nook).
+   */
+  private maybeSpawnBattery(x: number, bands: CloudBand[]) {
+    if (this.sinceBattery < 2) return; // never back-to-back
+    if (Math.random() > 0.45) return;
+
+    const pTop = MARGIN;
+    const pBot = H - GROUND_H - MARGIN;
+    // Open spans = sky above the first band, between bands, below the last.
+    const spans: [number, number][] = [];
+    let prev = pTop;
+    for (const b of bands) {
+      spans.push([prev, b.top]);
+      prev = b.bot;
+    }
+    spans.push([prev, pBot]);
+
+    const clearance = BATTERY_R * 2 + 10;
+    const reachable = spans.filter(([a, b]) => b - a >= clearance);
+    if (!reachable.length) return;
+    // Prefer the tightest reachable gap so the prize sits in a hard spot.
+    reachable.sort((p, q) => p[1] - p[0] - (q[1] - q[0]));
+    const [a, b] = reachable[0];
+
+    this.batteries.push({
+      x: x + CLOUD_W / 2,
+      y: (a + b) / 2,
+      value: 5 + this.level.index * 2,
+      bob: Math.random() * Math.PI * 2,
+      collected: false,
+    });
+    this.sinceBattery = 0;
   }
 
   private loop(t: number) {
@@ -146,11 +276,21 @@ export class GameEngine {
         ? effectiveScrollSpeed(this.level, this.distance)
         : 60; // gentle drift in attract mode
 
-    // Scroll the cloud field.
-    for (const c of this.columns) c.x -= speed * dt;
-    if (this.columns.length && this.columns[0].x < -COL_W) this.columns.shift();
-    const last = this.columns[this.columns.length - 1];
-    if (last && last.x < W - this.level.spacing) this.columns.push(this.makeColumn(last.x + this.level.spacing));
+    // Scroll the cloud field and the floating batteries together.
+    const dx = speed * dt;
+    for (const o of this.obstacles) o.x -= dx;
+    for (const b of this.batteries) b.x -= dx;
+    if (this.obstacles.length && this.obstacles[0].x < -CLOUD_W) this.obstacles.shift();
+    this.batteries = this.batteries.filter((b) => b.x > -BATTERY_R * 2 && !b.collected);
+    const last = this.obstacles[this.obstacles.length - 1];
+    if (last && last.x < W - this.level.spacing) this.spawnObstacle(last.x + this.level.spacing);
+
+    // Drift the captured-energy pops upward and fade them out.
+    for (const p of this.pops) {
+      p.y -= 22 * dt;
+      p.life -= dt * 1.3;
+    }
+    this.pops = this.pops.filter((p) => p.life > 0);
 
     if (this.status === 'idle') {
       this.bob += dt;
@@ -193,12 +333,28 @@ export class GameEngine {
     }
     if (this.flash > 0) this.flash = Math.max(0, this.flash - dt);
 
-    // Dodge scoring + bonus energy for keeping the sun on the panels.
-    for (const c of this.columns) {
-      if (!c.passed && c.x + COL_W < SUN_X) {
-        c.passed = true;
+    // Dodge scoring + bonus energy for threading each cloud column.
+    for (const o of this.obstacles) {
+      if (!o.passed && o.x + CLOUD_W < SUN_X) {
+        o.passed = true;
         this.energy += 0.5 * this.level.index;
         this.sfx.point();
+      }
+    }
+
+    // Capture floating storage batteries.
+    for (const b of this.batteries) {
+      if (b.collected) continue;
+      const by = b.y + Math.sin(this.bob * 3 + b.bob) * 4; // matches the render bob
+      const dxb = SUN_X - b.x;
+      const dyb = this.sunY - by;
+      if (dxb * dxb + dyb * dyb <= (SUN_R + BATTERY_R) * (SUN_R + BATTERY_R)) {
+        b.collected = true;
+        this.energy += b.value;
+        this.storageKwh += b.value;
+        this.batteriesCollected++;
+        this.sfx.battery();
+        this.pops.push({ x: b.x, y: by - BATTERY_R - 4, life: 1, text: `+${b.value.toFixed(0)} kWh` });
       }
     }
 
@@ -217,11 +373,17 @@ export class GameEngine {
   private checkCollision(): boolean {
     if (this.sunY - SUN_R <= 0) return true; // flew into the ceiling
     if (this.sunY + SUN_R >= H - GROUND_H) return true; // dove into the panels
-    for (const c of this.columns) {
-      if (SUN_X + SUN_R < c.x || SUN_X - SUN_R > c.x + COL_W) continue;
-      const top = c.gapY - c.gap / 2;
-      const bot = c.gapY + c.gap / 2;
-      if (this.sunY - SUN_R < top || this.sunY + SUN_R > bot) return true;
+    // Circle-vs-rounded-band test, inset slightly so the puffy edges feel fair.
+    const pad = 3;
+    for (const o of this.obstacles) {
+      if (SUN_X + SUN_R < o.x + pad || SUN_X - SUN_R > o.x + CLOUD_W - pad) continue;
+      for (const band of o.bands) {
+        const cx = Math.max(o.x + pad, Math.min(SUN_X, o.x + CLOUD_W - pad));
+        const cy = Math.max(band.top + pad, Math.min(this.sunY, band.bot - pad));
+        const ddx = SUN_X - cx;
+        const ddy = this.sunY - cy;
+        if (ddx * ddx + ddy * ddy < SUN_R * SUN_R) return true;
+      }
     }
     return false;
   }
@@ -239,6 +401,8 @@ export class GameEngine {
       topLevel: this.level.index,
       topLevelTitle: this.level.title,
       isHighScore,
+      batteries: this.batteriesCollected,
+      storageKwh: this.storageKwh,
       ...conv,
     };
     this.emitStats();
@@ -252,6 +416,8 @@ export class GameEngine {
       powerKw: this.level.powerKw,
       level: this.level,
       multiplier: this.level.index,
+      batteries: this.batteriesCollected,
+      storageKwh: this.storageKwh,
     };
     this.cb.onStats(stats);
   }
@@ -290,11 +456,15 @@ export class GameEngine {
       ctx.restore();
     }
 
-    // Cloud columns.
-    for (const c of this.columns) this.renderColumn(c, lvl);
+    // Free-floating clouds, then the batteries tucked between them.
+    for (const o of this.obstacles) {
+      for (const band of o.bands) this.renderCloud(o.x, band, lvl);
+    }
+    this.renderBatteries();
 
     this.renderPanels(lvl);
     this.renderSun();
+    this.renderPops();
 
     // Arcade score chip + level banner.
     this.renderHud();
@@ -332,29 +502,106 @@ export class GameEngine {
     }
   }
 
-  private renderColumn(c: Column, lvl: LevelTheme) {
-    const top = c.gapY - c.gap / 2;
-    const bot = c.gapY + c.gap / 2;
-    this.cloudBank(c.x, 0, top, lvl, true);
-    this.cloudBank(c.x, bot, H - GROUND_H - bot, lvl, false);
+  /** Draw one free-floating cloud as a lumpy blob with open sky all around. */
+  private renderCloud(x: number, band: CloudBand, lvl: LevelTheme) {
+    const ctx = this.ctx;
+    const h = band.bot - band.top;
+    if (h <= 0) return;
+    const cx = x + CLOUD_W / 2;
+    const cy = (band.top + band.bot) / 2;
+    const rx = CLOUD_W / 2;
+    const ry = h / 2;
+
+    // Shadowed underbelly: same blob nudged down, drawn first.
+    ctx.fillStyle = lvl.cloudShade;
+    this.blob(cx, cy + 3, rx, ry, band.seed);
+    // Main puff.
+    ctx.fillStyle = lvl.cloud;
+    this.blob(cx, cy, rx, ry, band.seed);
+    // Soft highlight near the top-left for a little volume.
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(cx - rx * 0.3, cy - ry * 0.35, Math.max(3, ry * 0.4), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
   }
 
-  private cloudBank(x: number, y: number, h: number, lvl: LevelTheme, fromTop: boolean) {
-    if (h <= 0) return;
+  /** A cluster of overlapping circles filling an ellipse → a fluffy cloud. */
+  private blob(cx: number, cy: number, rx: number, ry: number, seed: number) {
     const ctx = this.ctx;
-    ctx.fillStyle = lvl.cloud;
-    ctx.fillRect(x, y, COL_W, h);
-    // Puffy edge facing the gap.
-    const edge = fromTop ? y + h : y;
-    ctx.fillStyle = lvl.cloud;
-    for (let i = 0; i <= COL_W; i += 14) {
-      ctx.beginPath();
-      ctx.arc(x + i, edge, 11, 0, Math.PI * 2);
-      ctx.fill();
+    const lobes = 5;
+    ctx.beginPath();
+    // Central mass keeps thin bands from looking like a dotted line.
+    ctx.ellipse(cx, cy, rx * 0.82, ry * 0.78, 0, 0, Math.PI * 2);
+    for (let i = 0; i < lobes; i++) {
+      const a = (i / lobes) * Math.PI * 2 + seed * 6;
+      const px = cx + Math.cos(a) * rx * 0.55;
+      const py = cy + Math.sin(a) * ry * 0.5;
+      const r = (0.42 + ((Math.sin(seed * 12 + i) + 1) / 2) * 0.22) * Math.min(rx, ry + 6);
+      ctx.moveTo(px + r, py);
+      ctx.arc(px, py, r, 0, Math.PI * 2);
     }
-    // Shaded underside.
-    ctx.fillStyle = lvl.cloudShade;
-    ctx.fillRect(x, fromTop ? edge - 4 : edge, COL_W, 4);
+    ctx.fill();
+  }
+
+  private renderBatteries() {
+    const ctx = this.ctx;
+    for (const b of this.batteries) {
+      if (b.collected) continue;
+      const y = b.y + Math.sin(this.bob * 3 + b.bob) * 4;
+      ctx.save();
+      ctx.translate(b.x, y);
+      // Enticing glow halo.
+      const pulse = 0.55 + ((Math.sin(this.bob * 5 + b.bob) + 1) / 2) * 0.45;
+      const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, BATTERY_R + 9);
+      glow.addColorStop(0, `rgba(80,225,150,${0.45 * pulse})`);
+      glow.addColorStop(1, 'rgba(80,225,150,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(0, 0, BATTERY_R + 9, 0, Math.PI * 2);
+      ctx.fill();
+      // Battery body (rounded cell) with a positive terminal nub.
+      const bw = 12;
+      const bh = 16;
+      ctx.fillStyle = '#0E3D2B';
+      ctx.fillRect(-bw / 2 - 1, -bh / 2 - 1, bw + 2, bh + 2);
+      ctx.fillStyle = '#27E08A';
+      ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
+      ctx.fillStyle = '#0E3D2B';
+      ctx.fillRect(-3, -bh / 2 - 3, 6, 3);
+      // Lightning bolt mark.
+      ctx.fillStyle = '#0E3D2B';
+      ctx.beginPath();
+      ctx.moveTo(1, -5);
+      ctx.lineTo(-3, 1);
+      ctx.lineTo(0, 1);
+      ctx.lineTo(-1, 5);
+      ctx.lineTo(3, -1);
+      ctx.lineTo(0, -1);
+      ctx.closePath();
+      ctx.fill();
+      // Twinkle.
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(BATTERY_R - 1, -BATTERY_R, 2, 2);
+      ctx.restore();
+    }
+  }
+
+  private renderPops() {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = '9px monospace';
+    for (const p of this.pops) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+      ctx.fillStyle = '#27E08A';
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.restore();
+    ctx.textAlign = 'left';
   }
 
   private renderPanels(lvl: LevelTheme) {
@@ -446,6 +693,19 @@ export class GameEngine {
       ctx.fillRect(W - 120, 8, 112, 22);
       ctx.fillStyle = '#CFE8FF';
       ctx.fillText(`${Math.floor(this.distance)} m`, W - 114, 14);
+
+      // Banked-storage tally (only once a battery has been captured).
+      if (this.batteriesCollected > 0) {
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(8, 34, 150, 20);
+        // Mini battery glyph.
+        ctx.fillStyle = '#27E08A';
+        ctx.fillRect(14, 39, 9, 10);
+        ctx.fillRect(23, 41, 2, 6);
+        ctx.fillStyle = '#9CF5C9';
+        ctx.font = '9px monospace';
+        ctx.fillText(`x${this.batteriesCollected}  +${this.storageKwh.toFixed(0)} kWh`, 30, 41);
+      }
     }
     if (this.flash > 0) {
       const a = Math.min(1, this.flash);

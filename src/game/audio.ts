@@ -37,6 +37,15 @@ export class SoundFx {
     this.blip(880, 0.06, 'triangle', 0.05);
   }
 
+  /** Bright rising sparkle when a storage battery is captured. */
+  battery() {
+    const ctx = this.ac();
+    if (!ctx) return;
+    [784, 1047, 1319, 1568].forEach((f, i) => {
+      window.setTimeout(() => this.blip(f, 0.1, 'triangle', 0.06), i * 55);
+    });
+  }
+
   levelUp() {
     const ctx = this.ac();
     if (!ctx) return;

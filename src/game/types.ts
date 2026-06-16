@@ -13,8 +13,10 @@ export interface LevelTheme {
   startsAt: number;
   /** Horizontal scroll speed in logical px/sec */
   scrollSpeed: number;
-  /** Vertical gap between cloud banks, in logical px */
-  gap: number;
+  /** Smallest vertical opening (in logical px) the sun must fit through */
+  minGap: number;
+  /** Base number of free-floating cloud bands per column */
+  clouds: number;
   /** Horizontal spacing between cloud columns, in logical px */
   spacing: number;
   /** Real-world power factor: kW the array produces in these conditions */
@@ -33,6 +35,10 @@ export interface LiveStats {
   powerKw: number;
   level: LevelTheme;
   multiplier: number;
+  /** Storage batteries captured this run */
+  batteries: number;
+  /** Bonus kWh banked from captured batteries */
+  storageKwh: number;
 }
 
 export interface RunSummary {
@@ -45,6 +51,10 @@ export interface RunSummary {
   phoneCharges: number;
   homeHours: number;
   isHighScore: boolean;
+  /** Storage batteries captured this run */
+  batteries: number;
+  /** Bonus kWh banked from captured batteries */
+  storageKwh: number;
 }
 
 export interface EngineCallbacks {
