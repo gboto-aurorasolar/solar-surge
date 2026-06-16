@@ -558,46 +558,58 @@ export class GameEngine {
   }
 
   /**
-   * Draw a cloud band as a vertical stack of overlapping puffs. A thin band
-   * reads as one fluffy cloud; a tall, edge-anchored band reads as a grouped
-   * cloud wall jutting from the ceiling or floor.
+   * Draw a cloud band as one cohesive fluffy mass. Lobes are wider than tall
+   * and overlap heavily, then get unioned into a single silhouette so the
+   * band reads as a cloud — not a stack of separate bubbles. A darker back
+   * layer (the canvas stand-in for z-order between overlapping puffs) and a
+   * single soft highlight give it volume. Thin bands become one flat puff;
+   * tall edge-anchored bands become a grouped cloud wall.
    */
   private renderCloud(x: number, band: CloudBand, lvl: LevelTheme) {
     const ctx = this.ctx;
     const h = band.bot - band.top;
     if (h <= 0) return;
     const cx = x + band.w / 2;
-    const r = band.w / 2; // puff radius
-    const usable = Math.max(0, h - r); // vertical travel for puff centres
-    const n = Math.max(1, Math.round(usable / (r * 0.7)) + 1);
+    const halfW = band.w / 2;
 
-    const layer = (color: string, dy: number) => {
+    // Lobes are clearly wider than tall; shrink to fit short bands.
+    const ry = Math.max(8, Math.min(halfW * 0.7, h / 2));
+    const step = ry * 0.7; // heavy vertical overlap → lobes merge cleanly
+
+    type Lobe = { x: number; y: number; rx: number; ry: number };
+    const lobes: Lobe[] = [];
+    const topC = band.top + ry;
+    const botC = Math.max(topC, band.bot - ry);
+    let k = 0;
+    for (let cy = topC; ; cy += step, k++) {
+      const cyc = Math.min(cy, botC);
+      // Gentle side wander keeps the silhouette bumpy without leaving notches.
+      const ox = Math.sin(band.seed * 9 + k * 2.3) * halfW * 0.22;
+      const wob = 0.86 + 0.22 * Math.abs(Math.sin(band.seed * 3.1 + k * 1.7));
+      lobes.push({ x: cx + ox, y: cyc, rx: halfW * wob, ry: ry * (0.92 + 0.12 * Math.sin(band.seed + k)) });
+      if (cyc >= botC) break;
+    }
+
+    const fillMass = (color: string, dy: number) => {
       ctx.fillStyle = color;
       ctx.beginPath();
-      for (let i = 0; i < n; i++) {
-        const t = n === 1 ? 0.5 : i / (n - 1);
-        const cy = band.top + r * 0.5 + usable * t + dy;
-        const ox = Math.sin(band.seed * 12 + i * 1.9) * r * 0.28;
-        const pr = r * (0.82 + 0.18 * Math.sin(band.seed * 5 + i * 1.3));
-        ctx.moveTo(cx + ox + pr, cy);
-        ctx.arc(cx + ox, cy, pr, 0, Math.PI * 2);
-      }
+      for (const l of lobes) ctx.ellipse(l.x, l.y + dy, l.rx, l.ry, 0, 0, Math.PI * 2);
       ctx.fill();
     };
-    layer(lvl.cloudShade, 3); // shadowed underbelly
-    layer(lvl.cloud, 0); // main body
 
-    // Soft highlights for a little volume.
+    // Shade drawn straight below the body → a clean underbelly, no inner seams.
+    fillMass(lvl.cloudShade, Math.min(5, ry * 0.3));
+    // Main fluffy body.
+    fillMass(lvl.cloud, 0);
+
+    // One soft highlight near the top of the mass.
+    const t = lobes[0];
     ctx.save();
-    ctx.globalAlpha = 0.45;
+    ctx.globalAlpha = 0.28;
     ctx.fillStyle = '#FFFFFF';
-    for (let i = 0; i < n; i += 2) {
-      const t = n === 1 ? 0.5 : i / (n - 1);
-      const cy = band.top + r * 0.5 + usable * t;
-      ctx.beginPath();
-      ctx.arc(cx - r * 0.3, cy - r * 0.3, Math.max(2, r * 0.3), 0, Math.PI * 2);
-      ctx.fill();
-    }
+    ctx.beginPath();
+    ctx.ellipse(t.x - t.rx * 0.22, t.y - t.ry * 0.2, t.rx * 0.6, t.ry * 0.5, 0, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
   }
 
